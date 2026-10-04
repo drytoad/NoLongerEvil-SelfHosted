@@ -60,6 +60,13 @@ from nolongerevil.config.environment import settings
 from nolongerevil.lib.logger import get_logger
 from nolongerevil.lib.serial_parser import extract_serial_from_request, extract_weave_device_id
 from nolongerevil.lib.types import DeviceObject
+from nolongerevil.routes.nest.transport_diagnostics import (
+    is_legacy_v3,
+    legacy_json_dumps,
+    log_transport_request,
+    target_values,
+    transport_response_body,
+)
 from nolongerevil.services.device_availability import DeviceAvailability
 from nolongerevil.services.device_state_service import DeviceStateService
 from nolongerevil.services.sqlmodel_service import SQLModelService
@@ -146,6 +153,22 @@ def parse_subscribe_body(body: dict[str, Any]) -> tuple[str, bool, list[dict[str
     session = body.get("session", "")
     chunked = body.get("chunked", False)
 
+    # Transport v3 requests describe subscriptions as key/version/timestamp.
+    if isinstance(body.get("keys"), list):
+        return (
+            session,
+            True,
+            [
+                {
+                    "object_key": obj["key"],
+                    "object_revision": obj.get("version", 0),
+                    "object_timestamp": obj.get("timestamp", 0),
+                }
+                for obj in body["keys"]
+                if isinstance(obj, dict) and isinstance(obj.get("key"), str)
+            ],
+        )
+
     # Check for objects array first
     if "objects" in body and isinstance(body["objects"], list):
         return session, chunked, body["objects"]
@@ -165,38 +188,87 @@ def parse_subscribe_body(body: dict[str, Any]) -> tuple[str, bool, list[dict[str
 
 
 def parse_put_body(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    """Parse PUT request body supporting both formats.
+    """Parse PUT request bodies including legacy Nest transport v3.
 
-    Format 1 (objects array):
-    {"session": "...", "objects": [{"object_key": "...", "value": {...}}]}
+    Supported formats:
 
-    Format 2 (bucket-keyed - per spec):
-    {"session": "...", "shared.SERIAL": {"object_key": "...", "target_temperature": 21.5}}
+    Modern objects array:
+        {"objects": [{"object_key": "device.SERIAL", "value": {...}}]}
 
-    In bucket-keyed format, data fields are inline with metadata (object_key,
-    base_object_revision, if_object_revision). We extract inline fields into
-    a value dict.
+    Modern bucket-keyed:
+        {"device.SERIAL": {"object_key": "device.SERIAL", ...}}
 
-    Returns:
-        Tuple of (session, objects_list)
+    Legacy v3 nested buckets:
+        {
+            "device": {"SERIAL": {...}},
+            "shared": {"SERIAL": {...}}
+        }
     """
     session = body.get("session", "")
 
-    # Check for objects array first
+    # Modern objects-array format
     if "objects" in body and isinstance(body["objects"], list):
         return session, body["objects"]
 
-    # Parse bucket-keyed format
     objects: list[dict[str, Any]] = []
-    metadata_fields = {"object_key", "base_object_revision", "if_object_revision"}
+
+    # Legacy transport v3:
+    #
+    #   "device": {
+    #       "SERIAL": { ...state... }
+    #   },
+    #   "shared": {
+    #       "SERIAL": { ...state... }
+    #   }
+    #
+    # Convert these to the DeviceObject-style representation used
+    # internally by the current server.
+    for bucket in KNOWN_BUCKET_TYPES:
+        bucket_data = body.get(bucket)
+
+        if not isinstance(bucket_data, dict):
+            continue
+
+        # A current-format named bucket is handled below instead.
+        if "object_key" in bucket_data:
+            continue
+
+        converted = []
+
+        for identifier, value in bucket_data.items():
+            if not isinstance(value, dict):
+                continue
+
+            converted.append(
+                {
+                    "object_key": f"{bucket}.{identifier}",
+                    "value": value,
+                }
+            )
+
+        if converted:
+            objects.extend(converted)
+
+    if objects:
+        logger.debug(
+            f"Parsed legacy v3 PUT: {len(objects)} object(s): {[o['object_key'] for o in objects]}"
+        )
+        return session, objects
+
+    # Existing bucket-keyed format
+    metadata_fields = {
+        "object_key",
+        "base_object_revision",
+        "if_object_revision",
+    }
 
     for key, value in body.items():
         if key == "session":
             continue
-        # Keys like "shared.SERIAL" or "device.SERIAL"
+
         if isinstance(value, dict) and "object_key" in value:
-            # Extract inline fields into value dict (excluding metadata)
             inline_value = {k: v for k, v in value.items() if k not in metadata_fields}
+
             objects.append(
                 {
                     "object_key": value["object_key"],
@@ -268,11 +340,90 @@ async def handle_transport_get(request: web.Request) -> web.Response:
         }
         for obj in objects
     ]
+    if is_legacy_v3(request.path):
+        response_objects = [format_object_for_response(obj) for obj in objects]
 
     return web.json_response(
-        {"objects": response_objects},
+        transport_response_body(request.path, serial, response_objects, reason="device-list"),
         headers=_make_response_headers(),
+        dumps=legacy_json_dumps if is_legacy_v3(request.path) else json.dumps,
     )
+
+
+async def handle_legacy_v3_subscribe(
+    request: web.Request, serial: str, session: str, objects: list[dict[str, Any]]
+) -> web.Response:
+    """Deliver one v3 bucket with the SKV headers consumed by firmware 4.0.6.
+
+    Unlike modern clients, v3 has no objects envelope in subscribe responses.
+    It consumes a plain bucket value and identifies it using HTTP SKV headers.
+    Additional buckets are picked up on the next poll from stored timestamps.
+    """
+    state_service: DeviceStateService = request.app["state_service"]
+    manager: SubscriptionManager = request.app["subscription_manager"]
+    requested = {obj["object_key"]: obj for obj in objects}
+
+    def newer(obj: dict[str, Any]) -> bool:
+        client = requested.get(obj["object_key"])
+        if client is None:
+            return False
+        server_ts = obj["object_timestamp"]
+        client_ts = client.get("object_timestamp", 0)
+        return server_ts > client_ts or (
+            server_ts == client_ts and obj["object_revision"] > client.get("object_revision", 0)
+        )
+
+    def respond(obj: dict[str, Any]) -> web.Response:
+        headers = _make_response_headers(
+            include_disable_defer=bool(target_values(obj.get("value") or {}))
+        )
+        headers.update(
+            {
+                "X-nl-skv-key": obj["object_key"],
+                "X-nl-skv-version": str(obj["object_revision"]),
+                "X-nl-skv-timestamp": str(obj["object_timestamp"]),
+            }
+        )
+        logger.debug(
+            "Transport response: serial=%s path=%s response_format=legacy-v3-skv "
+            "object_key=%s targets=%s",
+            serial,
+            request.path,
+            obj["object_key"],
+            target_values(obj.get("value") or {}),
+        )
+        return web.json_response(obj.get("value") or {}, headers=headers)
+
+    for key in requested:
+        stored = state_service.get_object(serial, key)
+        if stored:
+            obj = format_object_for_response(stored)
+            if newer(obj):
+                return respond(obj)
+
+    subscription = await manager.add_long_poll_subscription(serial, session)
+    if subscription is None:
+        return web.Response(body=b"", headers=_make_response_headers())
+    try:
+        async with asyncio.timeout(settings.connection_hold_timeout):
+            while True:
+                # Legacy clients can replace a pending poll when they wake.
+                # A queued-response handler has not written headers yet, so
+                # explicitly release polls whose peer has disconnected.
+                if request.transport is None or request.transport.is_closing():
+                    return web.Response(body=b"", headers=_make_response_headers())
+                try:
+                    changes = await asyncio.wait_for(subscription.notify_queue.get(), timeout=1)
+                except TimeoutError:
+                    continue
+                for obj in changes:
+                    if newer(obj):
+                        return respond(obj)
+    except TimeoutError:
+        # The legacy parser treats a zero-length response as a service tickle.
+        return web.Response(body=b"", headers=_make_response_headers())
+    finally:
+        await manager.remove_long_poll_subscription(subscription)
 
 
 def _make_response_headers(
@@ -341,6 +492,10 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
 
     # Parse body supporting both formats (named fields or objects array)
     session, chunked, objects = parse_subscribe_body(body)
+    log_transport_request(request.path, serial, body, objects)
+    if is_legacy_v3(request.path):
+        session = session or request.headers.get("X-nl-session-id", "")
+        return await handle_legacy_v3_subscribe(request, serial, session, objects)
     if not session:
         session = f"session_{serial}_{int(time.time() * 1000)}"
     weave_device_id = extract_weave_device_id(request)
@@ -653,11 +808,13 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
         if outdated_objects:
             formatted_objs = [format_object_for_response(obj) for obj in outdated_objects]
             return web.json_response(
-                {"objects": formatted_objs},
+                transport_response_body(
+                    request.path, serial, formatted_objs, reason="non-chunked-update"
+                ),
                 headers=_make_response_headers(),
             )
         return web.json_response(
-            {"objects": []},
+            transport_response_body(request.path, serial, [], reason="non-chunked-empty"),
             headers=_make_response_headers(),
         )
 
@@ -702,7 +859,9 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
     if outdated_objects:
         formatted_objs = [format_object_for_response(obj) for obj in outdated_objects]
         logger.debug(f"Sending {len(outdated_objects)} outdated object(s) immediately for {serial}")
-        body_data = json.dumps({"objects": formatted_objs}).encode("utf-8")
+        body_data = json.dumps(
+            transport_response_body(request.path, serial, formatted_objs, reason="immediate-update")
+        ).encode("utf-8")
         await response.write(body_data)
         await response.write_eof()
         return response
@@ -713,7 +872,11 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
     if subscription is None:
         # Too many subscriptions - send empty response and close
         logger.warning(f"Too many subscriptions for {serial}")
-        await response.write(json.dumps({"objects": []}).encode("utf-8"))
+        await response.write(
+            json.dumps(
+                transport_response_body(request.path, serial, [], reason="subscription-limit")
+            ).encode("utf-8")
+        )
         await response.write_eof()
         return response
 
@@ -737,7 +900,11 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                 timeout=settings.connection_hold_timeout,
             )
             # Real data arrived - send it to wake the device
-            body_bytes = json.dumps({"objects": changed_objects}).encode("utf-8")
+            body_bytes = json.dumps(
+                transport_response_body(
+                    request.path, serial, changed_objects, reason="queued-update"
+                )
+            ).encode("utf-8")
             await response.write(body_bytes)
             data_sent = True
             total_bytes = len(body_bytes)
@@ -753,7 +920,11 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                         notify_queue.get(),
                         timeout=INTER_CHUNK_BATCH_TIMEOUT,
                     )
-                    body_bytes = json.dumps({"objects": changed_objects}).encode("utf-8")
+                    body_bytes = json.dumps(
+                        transport_response_body(
+                            request.path, serial, changed_objects, reason="batched-update"
+                        )
+                    ).encode("utf-8")
                     await response.write(body_bytes)
                     total_bytes += len(body_bytes)
                     chunk_count += 1
@@ -820,8 +991,9 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    # Parse body supporting both formats (objects array or bucket-keyed)
+    # Includes the confirmed nested legacy-v3 ingestion format.
     _session, objects = parse_put_body(body)
+    log_transport_request(request.path, serial, body, objects)
     if not isinstance(objects, list):
         return web.Response(text="Invalid request: objects array required", status=400)
 
@@ -874,6 +1046,20 @@ async def handle_transport_put(request: web.Request) -> web.Response:
             logger.debug(f"PUT: {object_key} base_object_revision={base_rev}")
 
         existing_value = server_obj.value if server_obj else {}
+        if object_key == f"shared.{serial}" and existing_value.get("target_change_pending"):
+            incoming_targets = target_values(value)
+            changed_targets = {
+                key: {"stored": existing_value.get(key), "incoming": incoming}
+                for key, incoming in incoming_targets.items()
+                if incoming != existing_value.get(key)
+            }
+            if changed_targets:
+                logger.debug(
+                    "Transport PUT while target change pending: serial=%s path=%s changes=%s",
+                    serial,
+                    request.path,
+                    changed_targets,
+                )
         merged_value = {**existing_value, **value}
 
         # Store weave_device_id if provided
@@ -949,8 +1135,11 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     # which is the correct mechanism.  Removed 2026-02-09.
 
     return web.json_response(
-        {"objects": response_objects},
+        transport_response_body(
+            request.path, serial, response_objects, reason="put-acknowledgement"
+        ),
         headers=_make_response_headers(),
+        dumps=legacy_json_dumps if is_legacy_v3(request.path) else json.dumps,
     )
 
 

@@ -121,3 +121,19 @@ debug-logs/
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Private transport investigation artifacts
+.nle-known-hosts
+gen2-*.bin
+upstairs-gen2-*.bin
+nle-*.json
+nle-*.tar.gz
+*_nest_transport_*.json
+transport-gen2-working.py
+gen2-ingestion-diagnostics.patch
+nle_read_thermostat.py
+nle_validate_v3.py
+inspect_gen2.py
+firmware-tree.json
+firmware-ssh-handler.js
+firmware-nleapi

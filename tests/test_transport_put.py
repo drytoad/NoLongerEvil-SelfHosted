@@ -27,6 +27,7 @@ ALLOWED_RESPONSE_KEYS = {"object_revision", "object_timestamp", "object_key"}
 def _make_request(state_service: DeviceStateService, objects: list[dict]) -> Mock:
     """Build a mock aiohttp request for handle_transport_put."""
     req = Mock(spec=web.Request)
+    req.path = "/nest/transport/v7/put"
     req.headers = {"Authorization": AUTH_HEADER}
     req.json = AsyncMock(return_value={"objects": objects})
     req.app = {"state_service": state_service}
@@ -257,6 +258,7 @@ async def test_put_does_not_access_subscription_manager(
     spy_app: dict = {"state_service": state_service}
 
     req = Mock(spec=web.Request)
+    req.path = "/nest/transport/v7/put"
     req.headers = {"Authorization": AUTH_HEADER}
     req.json = AsyncMock(
         return_value={

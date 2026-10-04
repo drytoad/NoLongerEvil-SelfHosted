@@ -20,7 +20,9 @@ from nolongerevil.services.weather_service import WeatherService
 def temp_db_path() -> Generator[str, None, None]:
     """Create a temporary database path."""
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
-        yield f.name
+        db_path = f.name
+    # Release the Windows file handle before SQLite opens or deletes the file.
+    yield db_path
     Path(f.name).unlink(missing_ok=True)
 
 
@@ -39,6 +41,9 @@ async def state_service(
     sqlmodel_service: SQLModelService,
 ) -> AsyncGenerator[DeviceStateService, None]:
     """Create and initialize a DeviceStateService."""
+    # DeviceStateService.initialize() initializes its storage again. Dispose
+    # the fixture's first engine so it cannot retain a Windows SQLite lock.
+    await sqlmodel_service.close()
     service = DeviceStateService(sqlmodel_service)
     await service.initialize()
     yield service

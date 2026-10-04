@@ -560,7 +560,19 @@ async def execute_command(
         )
 
     # Notify subscribers
-    await subscription_manager.notify_all_subscribers(serial, [updated_obj])
+    notified = await subscription_manager.notify_all_subscribers(serial, [updated_obj])
+
+    logger.debug(
+        "Command delivery: serial=%s command=%s object_key=%s revision=%s "
+        "timestamp=%s values=%s subscribers_notified=%s (queued, not device acknowledgement)",
+        serial,
+        command,
+        object_key,
+        new_revision,
+        updated_obj.object_timestamp,
+        values if command == "set_temperature" else "omitted",
+        notified,
+    )
 
     logger.info(f"Command {command} executed for device {serial}")
 
