@@ -1,0 +1,112 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+
+bashio::log.info "Starting NoLongerEvil Add-on..."
+
+# Read user configuration from options
+DEBUG_LOGGING=$(bashio::config 'debug_logging')
+ENTRY_KEY_TTL_SECONDS=$(bashio::config 'entry_key_ttl_seconds')
+REQUIRE_DEVICE_PAIRING=$(bashio::config 'require_device_pairing')
+
+# Container always listens on these ports
+SERVER_PORT=8000
+CONTROL_PORT=8082
+
+# Get API_ORIGIN from user config (REQUIRED - must include port)
+if bashio::config.has_value 'api_origin'; then
+    API_ORIGIN=$(bashio::config 'api_origin')
+    bashio::log.info "Using configured API origin: ${API_ORIGIN}"
+
+    # Validate api_origin format: must be a valid URL with protocol and port
+    if ! echo "${API_ORIGIN}" | grep -qE '^https?://[^/:]+:[0-9]+$'; then
+        bashio::log.fatal "api_origin must be a valid URL with protocol, hostname, and port"
+        bashio::log.fatal "Current value: ${API_ORIGIN}"
+        bashio::log.fatal "Expected format: http://<hostname-or-ip>:<port>"
+        bashio::log.fatal "Examples:"
+        bashio::log.fatal "  http://192.168.1.100:9543"
+        bashio::log.fatal "  http://homeassistant.local:9543"
+        exit 1
+    fi
+else
+    bashio::log.fatal "api_origin is required! Please configure it in the add-on settings."
+    bashio::log.fatal "Example: http://192.168.1.100:9543"
+    exit 1
+fi
+
+# Check for manual MQTT configuration first
+MANUAL_MQTT_HOST=$(bashio::config 'mqtt_host')
+
+if bashio::var.has_value "${MANUAL_MQTT_HOST}"; then
+    bashio::log.info "Using manual MQTT configuration..."
+    MQTT_HOST="${MANUAL_MQTT_HOST}"
+    export MQTT_HOST
+    if bashio::config.has_value 'mqtt_port'; then
+        MQTT_PORT=$(bashio::config 'mqtt_port')
+    else
+        MQTT_PORT=1883
+    fi
+    export MQTT_PORT
+    MQTT_USER=$(bashio::config 'mqtt_user')
+    export MQTT_USER
+    MQTT_PASSWORD=$(bashio::config 'mqtt_password')
+    export MQTT_PASSWORD
+
+    bashio::log.info "MQTT configured (manual):"
+    bashio::log.info "  Host: ${MQTT_HOST}"
+    bashio::log.info "  Port: ${MQTT_PORT}"
+    bashio::log.info "  User: ${MQTT_USER}"
+elif bashio::services "mqtt" "host" > /dev/null 2>&1; then
+    bashio::log.info "Using MQTT service from Supervisor..."
+
+    # Extract MQTT credentials from Supervisor services API
+    MQTT_HOST=$(bashio::services "mqtt" "host")
+    export MQTT_HOST
+    MQTT_PORT=$(bashio::services "mqtt" "port")
+    export MQTT_PORT
+    MQTT_USER=$(bashio::services "mqtt" "username")
+    export MQTT_USER
+    MQTT_PASSWORD=$(bashio::services "mqtt" "password")
+    export MQTT_PASSWORD
+
+    bashio::log.info "MQTT configured (auto-discovered):"
+    bashio::log.info "  Host: ${MQTT_HOST}"
+    bashio::log.info "  Port: ${MQTT_PORT}"
+    bashio::log.info "  User: ${MQTT_USER}"
+else
+    bashio::log.fatal "MQTT is not configured!"
+    bashio::log.fatal ""
+    bashio::log.fatal "Option 1: Install the Mosquitto broker add-on"
+    bashio::log.fatal "  1. Go to Settings > Add-ons > Add-on Store"
+    bashio::log.fatal "  2. Search for 'Mosquitto broker'"
+    bashio::log.fatal "  3. Install and start the Mosquitto broker"
+    bashio::log.fatal "  4. Restart this add-on"
+    bashio::log.fatal ""
+    bashio::log.fatal "Option 2: Configure MQTT manually in add-on settings"
+    bashio::log.fatal "  Set mqtt_host, mqtt_port, mqtt_user, mqtt_password"
+    exit 1
+fi
+
+# Set environment variables for Python server
+export API_ORIGIN
+export SERVER_PORT
+export CONTROL_PORT
+export ENTRY_KEY_TTL_SECONDS
+export DEBUG_LOGGING
+export REQUIRE_DEVICE_PAIRING
+export DEBUG_LOGS_DIR=/data/debug-logs
+export SQLITE3_DB_PATH=/data/database.sqlite
+
+bashio::log.info "Configuration:"
+bashio::log.info "  API_ORIGIN: ${API_ORIGIN}"
+bashio::log.info "  SERVER_PORT: ${SERVER_PORT} (device API)"
+bashio::log.info "  CONTROL_PORT: ${CONTROL_PORT} (control API + web UI)"
+bashio::log.info "  DEBUG_LOGGING: ${DEBUG_LOGGING}"
+bashio::log.info "  REQUIRE_DEVICE_PAIRING: ${REQUIRE_DEVICE_PAIRING}"
+bashio::log.info "  MQTT_HOST: ${MQTT_HOST}"
+bashio::log.info "  MQTT_PORT: ${MQTT_PORT}"
+bashio::log.info ""
+bashio::log.info "Nest devices will connect to: ${API_ORIGIN}"
+
+# Start the Python server (handles everything: API, control, and web UI)
+bashio::log.info "Starting server..."
+exec python3 -m nolongerevil.main

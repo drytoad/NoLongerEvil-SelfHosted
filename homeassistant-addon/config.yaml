@@ -1,0 +1,44 @@
+---
+name: "NoLongerEvil Gen-2"
+description: "NLE Nest API - Self-hosted Nest thermostat control"
+url: "https://github.com/drytoad/NoLongerEvil-SelfHosted"
+version: "0.0.9-gen2"
+slug: "nolongerevil"
+init: false
+hassio_api: true
+services:
+  - mqtt:need
+ingress: true
+ingress_port: 8082
+panel_icon: "mdi:thermostat"
+panel_title: "NLE Thermostats"
+arch:
+  - aarch64
+  - amd64
+startup: services
+ports:
+  8082/tcp: null
+  8000/tcp: 9543
+ports_description:
+  8082/tcp: "Control API + Web UI (Ingress only)"
+  8000/tcp: "Proxy port (Nest device communication)"
+map:
+  - addon_config
+options:
+  api_origin: "http://homeassistant.local:9543"
+  entry_key_ttl_seconds: 3600
+  debug_logging: false
+  require_device_pairing: false
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+schema:
+  api_origin: str
+  entry_key_ttl_seconds: int
+  debug_logging: bool
+  require_device_pairing: bool
+  mqtt_host: str?
+  mqtt_port: port?
+  mqtt_user: str?
+  mqtt_password: password?
